@@ -1,0 +1,6 @@
+version: "1.0.0"
+description: "Opus audio codec (libopus) for ESP-IDF"
+# 基于 esphome/micro-opus，支持 Xtensa DSP 优化和 PSRAM
+dependencies:
+  esphome/micro-opus:
+    version: "^0.4.1"
