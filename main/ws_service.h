@@ -80,6 +80,10 @@ esp_err_t ws_service_deinit(void);
  */
 esp_err_t ws_service_send_opus_frame(const uint8_t *opus_data, size_t opus_len);
 esp_err_t ws_service_cancel_response(void);
+/** Main-task-only lifecycle APIs. RX callbacks never wait for audio tasks. */
+esp_err_t ws_service_authenticate(void);
+uint32_t ws_service_generation(void);
+void ws_service_log_cancel_wait(void);
 
 /** Generic JSON text send (for future protocol extensions). */
 esp_err_t ws_service_send_json(const char *json_str);

@@ -119,9 +119,19 @@ proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg)
     } else if (type_equals(type_val, type_len, "response.audio.done")) {
         msg->evt = PROTO_EVT_RESPONSE_DONE;
         msg->reason = parse_string_field(json_str, "reason", &msg->reason_len);
+    } else if (type_equals(type_val, type_len, "response.done")) {
+        msg->evt = PROTO_EVT_RESPONSE_TERMINAL;
+        msg->status = parse_string_field(json_str, "status", &msg->status_len);
+        msg->reason = parse_string_field(json_str, "reason", &msg->reason_len);
+    } else if (type_equals(type_val, type_len, "response.cancelled") ||
+               type_equals(type_val, type_len, "response.canceled")) {
+        msg->evt = PROTO_EVT_RESPONSE_TERMINAL;
+        msg->status = "cancelled";
+        msg->status_len = 9;
     } else if (type_equals(type_val, type_len, "error")) {
         msg->evt = PROTO_EVT_ERROR;
         msg->error_code = parse_int_field(json_str, "code", -1);
+        msg->error_code_text = parse_string_field(json_str, "code", &msg->error_code_text_len);
         msg->error_msg  = parse_string_field(json_str, "message", &msg->error_msg_len);
     } else {
         ESP_LOGD(TAG, "unknown frame type: %.*s", type_len, type_val);
@@ -180,6 +190,7 @@ const char *proto_event_name(proto_event_t evt)
         case PROTO_EVT_SPEECH_STARTED:  return "SPEECH_STARTED";
         case PROTO_EVT_SPEECH_STOPPED:  return "SPEECH_STOPPED";
         case PROTO_EVT_RESPONSE_DONE:   return "RESPONSE_DONE";
+        case PROTO_EVT_RESPONSE_TERMINAL:return "RESPONSE_TERMINAL";
         default:                        return "UNKNOWN";
     }
 }

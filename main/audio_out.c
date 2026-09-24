@@ -7,6 +7,9 @@
 #include "esp_codec_dev_defaults.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "pcm_policy.h"
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,7 +22,7 @@ static const audio_codec_if_t *dac_if, *adc_if;
 static const audio_codec_gpio_if_t *gpio_if;
 static opus_dec_handle_t decoder;
 static SemaphoreHandle_t output_lock;
-static audio_out_state_t state;
+static atomic_int state;
 static audio_out_event_cb_t callback;
 static void *callback_arg;
 static int16_t *playback_ref;
@@ -27,7 +30,18 @@ static size_t playback_ref_read;
 static size_t playback_ref_write;
 static size_t playback_ref_count;
 static SemaphoreHandle_t playback_ref_lock;
-static volatile bool playback_streaming;
+static atomic_bool playback_streaming;
+static TaskHandle_t playback_task;
+static atomic_bool task_exit, task_exited;
+static int16_t pcm_ring[PCM_CAPACITY], decode_pcm[1920];
+static size_t pcm_read, pcm_write, pcm_count;
+static bool stream_open, stream_eof, stream_drained = true, output_started;
+static unsigned drain_blocks, fade_samples;
+static int16_t last_sample;
+static uint32_t underruns, supplied_samples, decoded_packets, decode_max_us, write_max_us;
+static int64_t stats_at;
+static void playback_worker(void *arg);
+
 
 static void playback_ref_clear(void)
 {
@@ -62,6 +76,8 @@ esp_err_t audio_out_init(uint8_t i2c_addr)
     if (err!=ESP_OK) return err;
     i2s_chan_config_t channel=I2S_CHANNEL_DEFAULT_CONFIG(BSP_I2S_PORT,I2S_ROLE_MASTER);
     channel.auto_clear=true;
+    channel.dma_frame_num=PCM_BLOCK;
+    channel.dma_desc_num=PCM_DMA_BLOCKS;
     if ((err=i2s_new_channel(&channel,&tx,&rx))!=ESP_OK) return err;
     i2s_std_config_t config={
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_OUT_SAMPLE_RATE),
@@ -93,7 +109,7 @@ esp_err_t audio_out_init(uint8_t i2c_addr)
     esp_codec_dev_sample_info_t sample={.sample_rate=AUDIO_OUT_SAMPLE_RATE,.channel=2,.bits_per_sample=16};
     if ((err=esp_codec_dev_open(speaker,&sample))!=ESP_OK) goto fail;
     if ((err=esp_codec_dev_open(microphone,&sample))!=ESP_OK) goto fail;
-    if ((err=esp_codec_dev_set_out_vol(speaker,80))!=ESP_OK) goto fail;
+    if ((err=esp_codec_dev_set_out_vol(speaker,40))!=ESP_OK) goto fail;
     if ((err=esp_codec_dev_set_in_gain(microphone,30.0f))!=ESP_OK) goto fail;
     output_lock=xSemaphoreCreateMutex(); decoder=opus_dec_create(NULL);
     playback_ref_lock = xSemaphoreCreateMutex();
@@ -101,6 +117,16 @@ esp_err_t audio_out_init(uint8_t i2c_addr)
     if (!output_lock||!decoder||!playback_ref_lock||!playback_ref) {err=ESP_ERR_NO_MEM;goto fail;}
     playback_streaming = false;
     state=AUDIO_OUT_STATE_IDLE;
+    pcm_read=pcm_write=pcm_count=0;
+    stream_open=stream_eof=output_started=false;
+    stream_drained=true; last_sample=0;
+    atomic_store(&task_exit, false);
+    atomic_store(&task_exited, false);
+    if (xTaskCreatePinnedToCore(playback_worker, "pcm_output", 4096, NULL, 6,
+                                &playback_task, 1) != pdPASS) {
+        err=ESP_ERR_NO_MEM; goto fail;
+    }
+    ESP_LOGI("audio_out", "PCM output: 150 ms prefill, 500 ms capacity, DMA=60 ms, core=1 priority=6");
     event_bus_publish(EV_AUDIO_OUT_READY,NULL,0);
     if (callback) callback(AUDIO_OUT_EVENT_INIT_OK,callback_arg);
     return ESP_OK;
@@ -110,6 +136,11 @@ fail:
 
 esp_err_t audio_out_deinit(void)
 {
+    if (playback_task) {
+        atomic_store(&task_exit, true);
+        while (!atomic_load(&task_exited)) vTaskDelay(1);
+        playback_task=NULL;
+    }
     if (decoder) {opus_dec_destroy(decoder);decoder=NULL;}
     if (speaker) {esp_codec_dev_close(speaker);esp_codec_dev_delete(speaker);speaker=NULL;}
     if (microphone) {esp_codec_dev_close(microphone);esp_codec_dev_delete(microphone);microphone=NULL;}
@@ -129,23 +160,103 @@ esp_err_t audio_out_deinit(void)
     state=AUDIO_OUT_STATE_NONE; return ESP_OK;
 }
 
-/* Input length is bytes of mono PCM; hardware uses two slots. */
+/* All PCM state and hardware writes are serialized by output_lock.
+ * The output task continuously clocks silence too; an empty network queue never
+ * leaves stale DMA audio repeating. Reference is fed at output, not decode time.
+ * Software reference still needs acoustic alignment validation on the board. */
+static esp_err_t write_block(int16_t *mono)
+{
+    int16_t stereo[PCM_BLOCK * 2];
+    for (size_t i=0;i<PCM_BLOCK;++i) stereo[2*i]=stereo[2*i+1]=mono[i];
+    int64_t start=esp_timer_get_time();
+    esp_err_t err=esp_codec_dev_write(speaker,stereo,sizeof(stereo));
+    uint32_t elapsed=(uint32_t)(esp_timer_get_time()-start);
+    if (elapsed>write_max_us) write_max_us=elapsed;
+    if (err==ESP_OK) playback_ref_push(mono,PCM_BLOCK);
+    return err;
+}
+static void ramp_to_zero(int16_t *mono, size_t from)
+{
+    int16_t previous=from ? mono[from-1] : last_sample;
+    size_t n=PCM_BLOCK-from;
+    for(size_t i=0;i<n;++i) mono[from+i]=pcm_scale(previous,n-i-1,n);
+}
+static void playback_worker(void *arg)
+{
+    (void)arg;
+    while(!atomic_load(&task_exit)) {
+        int16_t mono[PCM_BLOCK]={0};
+        xSemaphoreTake(output_lock,portMAX_DELAY);
+        if(stream_open && !output_started && pcm_can_start(pcm_count,stream_eof)) {
+            output_started=true;
+            fade_samples=80; /* 5 ms onset ramp */
+            atomic_store(&playback_streaming,true);
+            event_bus_publish(EV_AUDIO_OUT_START,NULL,0);
+        }
+        size_t n=output_started ? pcm_take_count(pcm_count) : 0;
+        for(size_t i=0;i<n;++i) {
+            mono[i]=pcm_ring[pcm_read]; pcm_read=(pcm_read+1)%PCM_CAPACITY;
+            if(fade_samples) { mono[i]=pcm_scale(mono[i],80-fade_samples,80); --fade_samples; }
+        }
+        pcm_count-=n;
+        supplied_samples+=n;
+        if(output_started && n<PCM_BLOCK && !stream_eof) {
+            ++underruns;
+            ramp_to_zero(mono,n);
+            output_started=false; /* refill before resuming, count one per starvation */
+        } else if(stream_eof && !pcm_count && n<PCM_BLOCK && last_sample) {
+            ramp_to_zero(mono,n);
+        }
+        esp_err_t err=write_block(mono);
+        last_sample=mono[PCM_BLOCK-1];
+        if(stream_eof && !pcm_count && n==0) {
+            if(++drain_blocks>PCM_DMA_BLOCKS) {
+                stream_drained=true; stream_open=false; output_started=false;
+                atomic_store(&playback_streaming,false);
+                state=AUDIO_OUT_STATE_IDLE;
+            }
+        } else drain_blocks=0;
+        if(err!=ESP_OK) { state=AUDIO_OUT_STATE_ERROR; stream_drained=true; }
+        int64_t now=esp_timer_get_time();
+        bool report=stream_open && now-stats_at>=5000000;
+        size_t buffered=pcm_count;
+        uint32_t gaps=underruns, dec=decode_max_us, wr=write_max_us, samples=supplied_samples;
+        if(report) { stats_at=now; decode_max_us=write_max_us=0; }
+        xSemaphoreGive(output_lock);
+        if(report) ESP_LOGI("audio_out", "Playback stats: buffered_ms=%u starvations=%lu decode_max_us=%lu write_max_us=%lu pcm_ms=%lu",
+            (unsigned)(buffered/16),(unsigned long)gaps,(unsigned long)dec,(unsigned long)wr,(unsigned long)(samples/16));
+        if(err!=ESP_OK) { event_bus_publish(EV_AUDIO_INPUT_ERROR,NULL,0); vTaskDelay(pdMS_TO_TICKS(20)); }
+        /* Fairness between blocks even if DMA has several free descriptors. */
+        vTaskDelay(1);
+    }
+    atomic_store(&task_exited,true);
+    vTaskDelete(NULL);
+}
+
+/* Bounded producer backpressure. The WS worker owns the decoder and serializes
+ * this call with cancellation. A packet is at most 120 ms of mono PCM. */
 esp_err_t audio_out_write(const int16_t *pcm_data,size_t pcm_len)
 {
-    if (!speaker||!output_lock) return ESP_ERR_INVALID_STATE;
-    if (!pcm_data||pcm_len%sizeof(int16_t)) return ESP_ERR_INVALID_ARG;
-    int16_t stereo[256]; esp_err_t err=ESP_OK;
-    xSemaphoreTake(output_lock,portMAX_DELAY); state=AUDIO_OUT_STATE_PLAYING;
-    playback_ref_push(pcm_data, pcm_len / sizeof(int16_t));
-    for (size_t pos=0;pos<pcm_len/2&&err==ESP_OK;) {
-        size_t count=pcm_len/2-pos; if (count>128) count=128;
-        for (size_t i=0;i<count;i++) stereo[2*i]=stereo[2*i+1]=pcm_data[pos+i];
-        err=esp_codec_dev_write(speaker,stereo,count*4);pos+=count;
+    if(!speaker||!output_lock) return ESP_ERR_INVALID_STATE;
+    if(!pcm_data||pcm_len%sizeof(int16_t)) return ESP_ERR_INVALID_ARG;
+    size_t pos=0,total=pcm_len/sizeof(int16_t);
+    int64_t deadline=esp_timer_get_time()+2000000;
+    while(pos<total) {
+        xSemaphoreTake(output_lock,portMAX_DELAY);
+        if(!stream_open || stream_eof || state==AUDIO_OUT_STATE_ERROR) {
+            xSemaphoreGive(output_lock); return ESP_ERR_INVALID_STATE;
+        }
+        while(pos<total && pcm_count<PCM_CAPACITY) {
+            pcm_ring[pcm_write]=pcm_data[pos++];
+            pcm_write=(pcm_write+1)%PCM_CAPACITY; ++pcm_count;
+        }
+        xSemaphoreGive(output_lock);
+        if(pos<total) {
+            if(esp_timer_get_time()>deadline) return ESP_ERR_TIMEOUT;
+            vTaskDelay(1);
+        }
     }
-    state = err == ESP_OK
-                ? (playback_streaming ? AUDIO_OUT_STATE_PLAYING : AUDIO_OUT_STATE_IDLE)
-                : AUDIO_OUT_STATE_ERROR;
-    xSemaphoreGive(output_lock);return err;
+    return ESP_OK;
 }
 esp_err_t audio_out_read_microphones(int16_t *pcm,size_t bytes)
 {return microphone?esp_codec_dev_read(microphone,pcm,bytes):ESP_ERR_INVALID_STATE;}
@@ -158,8 +269,13 @@ void audio_out_read_playback_reference(int16_t *pcm, size_t samples)
         return;
     }
     xSemaphoreTake(playback_ref_lock, portMAX_DELAY);
+    size_t skip=pcm_reference_skip(playback_ref_count,samples);
+    playback_ref_read=(playback_ref_read+skip)%PLAYBACK_REF_CAP_SAMPLES;
+    playback_ref_count-=skip;
+    size_t available=pcm_reference_available(playback_ref_count);
+    size_t silence=samples>available?samples-available:0;
     for (size_t i = 0; i < samples; ++i) {
-        if (playback_ref_count > 0) {
+        if (i >= silence && playback_ref_count > PCM_DMA_SAMPLES) {
             pcm[i] = playback_ref[playback_ref_read];
             playback_ref_read = (playback_ref_read + 1) % PLAYBACK_REF_CAP_SAMPLES;
             playback_ref_count--;
@@ -172,40 +288,58 @@ void audio_out_read_playback_reference(int16_t *pcm, size_t samples)
 
 void audio_out_set_streaming(bool active)
 {
-    bool was_active = playback_streaming;
-    playback_streaming = active;
-    if (active) {
-        state = AUDIO_OUT_STATE_PLAYING;
-        if (!was_active) event_bus_publish(EV_AUDIO_OUT_START, NULL, 0);
-    } else {
-        state = AUDIO_OUT_STATE_IDLE;
-        playback_ref_clear();
+    xSemaphoreTake(output_lock,portMAX_DELAY);
+    if(active && !stream_open) {
+        pcm_read=pcm_write=pcm_count=0;
+        stream_open=true; stream_eof=false; stream_drained=false; output_started=false;
+        drain_blocks=0; underruns=supplied_samples=decoded_packets=decode_max_us=write_max_us=0;
+        stats_at=esp_timer_get_time(); state=AUDIO_OUT_STATE_PLAYING;
+    } else if(!active) {
+        stream_eof=true; drain_blocks=0; /* flush even replies shorter than prefill */
     }
+    xSemaphoreGive(output_lock);
 }
-
-bool audio_out_is_streaming(void)
+bool audio_out_is_streaming(void) { return atomic_load(&playback_streaming); }
+bool audio_out_is_drained(void)
 {
-    return playback_streaming;
+    xSemaphoreTake(output_lock,portMAX_DELAY);
+    bool done=stream_drained && state!=AUDIO_OUT_STATE_ERROR;
+    xSemaphoreGive(output_lock);
+    return done;
 }
 int audio_out_play_opus(const uint8_t *data,size_t len)
 {
-    if (!decoder||!data||!len) return -1;
-    int16_t *pcm=malloc(1920*sizeof(int16_t));if (!pcm) return -1;
-    int samples=opus_dec_decode(decoder,data,len,pcm,1920*sizeof(int16_t));
-    if (samples>0&&audio_out_write(pcm,samples*sizeof(int16_t))!=ESP_OK) samples=-1;
-    free(pcm);return samples;
+    if(!decoder||!data||!len) return -1;
+    int64_t start=esp_timer_get_time();
+    int samples=opus_dec_decode(decoder,data,len,decode_pcm,sizeof(decode_pcm));
+    uint32_t elapsed=(uint32_t)(esp_timer_get_time()-start);
+    xSemaphoreTake(output_lock,portMAX_DELAY);
+    if(elapsed>decode_max_us) decode_max_us=elapsed;
+    ++decoded_packets;
+    xSemaphoreGive(output_lock);
+    if(samples>0 && audio_out_write(decode_pcm,samples*sizeof(int16_t))!=ESP_OK) return -1;
+    return samples;
 }
 esp_err_t audio_out_stop(void)
 {
-    if (!output_lock) return ESP_ERR_INVALID_STATE;
+    if(!output_lock) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(output_lock,portMAX_DELAY);
-    playback_streaming = false;
-    playback_ref_clear();
-    esp_err_t err=i2s_channel_disable(tx);
-    if (err==ESP_OK) err=i2s_channel_enable(tx);
-    state=AUDIO_OUT_STATE_IDLE;xSemaphoreGive(output_lock);return err;
+    pcm_read=pcm_write=pcm_count=0;
+    stream_open=false; stream_eof=false; output_started=false;
+    atomic_store(&playback_streaming,false);
+    int16_t mono[PCM_BLOCK]={0};
+    ramp_to_zero(mono,0);
+    esp_err_t err=write_block(mono);
+    memset(mono,0,sizeof(mono));
+    /* Leave shared RX/TX clocks running. Flush the DMA horizon with zeros,
+     * so no old answer can leak into the next turn after this returns. */
+    for(unsigned i=0;i<=PCM_DMA_BLOCKS && err==ESP_OK;++i) err=write_block(mono);
+    last_sample=0; stream_drained=true;
+    state=err==ESP_OK?AUDIO_OUT_STATE_IDLE:AUDIO_OUT_STATE_ERROR;
+    xSemaphoreGive(output_lock);
+    return err;
 }
-esp_err_t audio_out_clear_queue(void) {return audio_out_stop();}
-audio_out_state_t audio_out_get_state(void) {return state;}
+esp_err_t audio_out_clear_queue(void) { return audio_out_stop(); }
+audio_out_state_t audio_out_get_state(void) { return atomic_load(&state); }
 void audio_out_set_event_cb(audio_out_event_cb_t cb,void *arg) {callback=cb;callback_arg=arg;}
-void audio_out_dump_stats(void) {ESP_LOGI("audio_out","state=%d",state);}
+void audio_out_dump_stats(void) {ESP_LOGI("audio_out","state=%d",atomic_load(&state));}

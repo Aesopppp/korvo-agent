@@ -34,10 +34,11 @@ extern "C" {
  * 常量配置
  * ========================================================================= */
 
-/** AFE ring buffer 大小：8 × 32ms 帧 ≈ 256ms 缓冲 */
+/** About ten seconds in PSRAM, including per-item ring-buffer headers. Keeps
+ * the start of a barge-in utterance during the eight-second cancel deadline. */
 #define WAKE_WORD_RB_ITEM_SIZE  512   /* 512 × int16 = 1024 bytes/帧 */
-#define WAKE_WORD_RB_ITEM_COUNT 8
-#define WAKE_WORD_RB_TOTAL_SIZE (WAKE_WORD_RB_ITEM_SIZE * WAKE_WORD_RB_ITEM_COUNT)
+#define WAKE_WORD_RB_ITEM_COUNT 320
+#define WAKE_WORD_RB_TOTAL_SIZE ((WAKE_WORD_RB_ITEM_SIZE * sizeof(int16_t) + 8) * WAKE_WORD_RB_ITEM_COUNT)
 
 /** feed_Task 栈深度 (AFE I²S 喂流，与参考例程一致) */
 #define WAKE_WORD_FEED_STACK    (8 * 1024)
@@ -104,6 +105,8 @@ void wake_word_deinit(void);
  * @return RingbufHandle_t，唤醒词初始化前为 NULL
  */
 RingbufHandle_t wake_word_get_ringbuf(void);
+/** Flush stale PCM with the upload task stopped. */
+void wake_word_clear_audio_buffer(void);
 
 /**
  * @brief 获取 AFE fetch 帧大小（samples）

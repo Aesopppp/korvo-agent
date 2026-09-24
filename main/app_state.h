@@ -26,6 +26,7 @@ typedef enum {
     APP_STATE_PLAYING,
     APP_STATE_ERROR,
     APP_STATE_SLEEP,
+    APP_STATE_CANCELLING,
 } app_state_t;
 
 const char *app_state_name(app_state_t state);
@@ -46,6 +47,7 @@ app_state_global_t *app_state_get_global(void);
 esp_err_t app_state_start_listening(void);
 esp_err_t app_state_back_to_wait_wake(bool from_timer);
 void app_state_reset_silence_timer(void);
+void app_state_pause_silence_timer(void);
 
 #ifdef __cplusplus
 }

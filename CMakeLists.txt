@@ -18,3 +18,12 @@ include("$ENV{IDF_PATH}/tools/cmake/project.cmake")
 set(COMPONENTS main)
 
 project(korvo_agent)
+
+# Xtensa GCC 14.2.0 ICEs in register allocation for this ESP-DSP 1.8.0
+# image-convolution fallback at -O2. Keep performance optimization elsewhere.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_EQUAL "14.2.0")
+    idf_component_get_property(korvo_dsp_lib espressif__esp-dsp COMPONENT_LIB)
+    idf_component_get_property(korvo_dsp_dir espressif__esp-dsp COMPONENT_DIR)
+    set_source_files_properties("${korvo_dsp_dir}/modules/conv/float/dspi_conv_f32_ansi.c"
+        TARGET_DIRECTORY ${korvo_dsp_lib} PROPERTIES COMPILE_OPTIONS "-O1")
+endif()

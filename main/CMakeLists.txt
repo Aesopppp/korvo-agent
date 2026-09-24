@@ -1,4 +1,4 @@
-﻿idf_component_register(
+idf_component_register(
     SRCS
         "app_main.c"
         "app_state.c"
@@ -7,9 +7,10 @@
         "wake_word.c"
         "audio_out.c"
         "ws_service.c"
-       
+
+
         "opus_codec.c"
-       
+
         "proto_service.c"
         "led_service.c"
         "tca9554.c"

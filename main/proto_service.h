@@ -50,6 +50,7 @@ typedef enum {
     PROTO_EVT_SPEECH_STOPPED       = 4,  /* input_audio_buffer.speech_stopped */
     /* AI reply lifecycle */
     PROTO_EVT_RESPONSE_DONE        = 5,  /* response.audio.done */
+    PROTO_EVT_RESPONSE_TERMINAL    = 6,  /* response.done / explicit cancelled */
 } proto_event_t;
 
 /* ---- Parsed message view ------------------------------------------------ */
@@ -60,6 +61,8 @@ typedef struct {
 
     /* error frame */
     int            error_code;
+    const char    *error_code_text;
+    int            error_code_text_len;
     const char    *error_msg;
     int            error_msg_len;
 
@@ -70,6 +73,8 @@ typedef struct {
     /* response.audio.done: optional reason */
     const char    *reason;
     int            reason_len;
+    const char    *status;
+    int            status_len;
 } proto_msg_t;
 
 /* ---- Public API --------------------------------------------------------- */

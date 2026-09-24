@@ -122,15 +122,15 @@ extern "C" {
  * Wi-Fi / - NVS- * ========================================================================= */
 #define WIFI_CONNECT_TIMEOUT_MS  15000
 #define WIFI_MAX_RETRY           5
-#define DEFAULT_WIFI_SSID ""
-#define DEFAULT_WIFI_PASSWORD ""
+#define DEFAULT_WIFI_SSID        ""
+#define DEFAULT_WIFI_PASSWORD    ""
 
 /* ===========================================================================
  * ACOS
  * ========================================================================= */
 #define WS_SERVICE_DEFAULT_HOST   "acos-platform.emicloud.com"
 #define ACOS_WS_URL              "wss://acos-platform.emicloud.com/acos-realtime"
-#define DEFAULT_ACOS_TOKEN ""
+#define DEFAULT_ACOS_TOKEN       ""
 #define ACOS_OPUS_BITRATE        24000   /* - Opus 24 kbps */
 /* -: ACOS  20ms/320 - */
 #define ACOS_OPUS_FRAME_MS_UPLOAD   20

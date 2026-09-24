@@ -48,11 +48,34 @@ The firmware supports wake-word activation and continued conversation, with a
 60-second inactivity timeout. The AFE uses two microphone channels and a
 digital playback reference for echo cancellation.
 
-Playback interruption is experimental: the current implementation uses AFE
-VAD plus an energy threshold, a 1.2-second playback guard, and ten consecutive
-speech frames. These settings were added to reduce false interruptions and
-still require hardware validation. A successful build does not establish AEC
-quality or reliable interruption behavior in a particular acoustic setup.
+Current firmware marker: `build=pcm-playback-v1`.
+
+- CPU runs at 240 MHz with performance compilation. A dedicated output task
+  plays from a 500 ms PCM buffer after a 150 ms prefill, using 10 ms I2S blocks.
+- Normal completion waits for the PCM and DMA tail. Interruption clears queued
+  audio and transitions to silence while keeping the shared microphone clock running.
+- WebSocket recovery retains an already awakened conversation within its timeout;
+  a fresh boot requires the wake word. Cancellation observes response boundaries
+  before resuming microphone upload.
+- Playback interruption uses AFE VAD, energy >=12000, a 1.2-second startup guard,
+  and 480 ms of sustained speech. AEC uses a software playback reference; acoustic
+  alignment still requires board validation.
+- `Playback stats` and `AFE stats` summarize buffering and processing time.
+
+The owner reported that slow/choppy playback and popping were resolved in the
+latest board test. This is not a guarantee across all networks/acoustic setups.
+Known limitation: while playing, only about 0.5 seconds of microphone history is
+retained. Detection and cancellation delays can truncate the beginning of a short
+interruption. Longer pre-roll and protected speech-onset buffering have been
+discussed but are **not implemented** in this snapshot.
+
+Full ESP-IDF build and partition checks passed for the local source before its
+credentials were removed for upload. Pure logic tests under `tests/` were checked
+at compile time; they are not hardware integration tests. Validation notes record
+the build-time status, so older notes may predate subsequent user board tests.
+
+With Xtensa GCC 14.2.0, the root CMake configuration applies `-O1` only to the
+ESP-DSP image-convolution fallback that crashes that compiler at `-O2`.
 
 ## Source layout
 
@@ -61,6 +84,7 @@ quality or reliable interruption behavior in a particular acoustic setup.
 - `dependencies.lock`: exact managed dependency versions.
 - `sdkconfig` and `sdkconfig.defaults`: build configuration.
 - `partitions.csv`: flash layout.
+- `tests/`: regression source files and validation records.
 
 Build outputs, downloaded components, local backups, editor settings, and logs
 are excluded by `.gitignore`.

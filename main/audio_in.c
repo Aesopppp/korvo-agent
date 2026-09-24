@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include <stdatomic.h>
 
 static const char *TAG = "audio_in";
 
@@ -62,7 +63,8 @@ struct audio_in_impl {
     /* 任务 */
     TaskHandle_t             task_h;
     SemaphoreHandle_t        done_sem;
-    bool                     running;
+    atomic_bool              running;
+    uint32_t                 connection_generation;
 
     /* 回调 */
     audio_in_pcm_cb_t        pcm_cb;
@@ -209,11 +211,19 @@ static void encode_and_send(audio_in_handle_t h, const int16_t *pcm,
 
     /* Opus 编码 */
     uint8_t opus_out[256];
-    for (size_t i = 0; i < pcm_samples; ++i) {
+    for (size_t i = 0; i < pcm_samples && h->running; ++i) {
         h->opus_pcm[h->opus_samples++] = pcm[i];
         if (h->opus_samples == 320) {
             int opus_len = opus_enc_encode(h->opus_enc, h->opus_pcm, sizeof(h->opus_pcm), opus_out, sizeof(opus_out));
-            if (opus_len > 0) ws_service_send_opus_frame(opus_out, opus_len);
+            if (opus_len > 0) {
+                esp_err_t err = ws_service_send_opus_frame(opus_out, opus_len);
+                if (err != ESP_OK && h->running) {
+                    ESP_LOGW(TAG, "Audio upload failed: %s; requesting recovery", esp_err_to_name(err));
+                    h->running = false;
+                    event_bus_publish(EV_AUDIO_UPLOAD_FAILED,
+                        (void *)(uintptr_t)h->connection_generation, 0);
+                }
+            }
             h->opus_samples = 0;
         }
     }
@@ -262,7 +272,7 @@ static void audio_in_task(void *param)
         encode_and_send(h, buf, samples_read, ts);
 
         /* VAD */
-        process_vad_frame(h, buf, samples_read, ts);
+        if (h->running) process_vad_frame(h, buf, samples_read, ts);
 
         /* 归还 buffer */
         vRingbufferReturnItem(h->ringbuf, buf);
@@ -335,7 +345,7 @@ audio_in_handle_t audio_in_create(const audio_in_config_t *cfg)
 void audio_in_destroy(audio_in_handle_t h)
 {
     if (h == NULL) return;
-    if (h->running) audio_in_stop(h);
+    if (audio_in_stop(h) != ESP_OK) return;
 
     if (h->opus_enc) {
         opus_enc_destroy(h->opus_enc);
@@ -359,9 +369,15 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
     if (h == NULL) return ESP_ERR_INVALID_ARG;
     if (h->running) return ESP_OK;
     if (ringbuf == NULL) return ESP_ERR_INVALID_ARG;
+    if (h->task_h) {
+        esp_err_t err = audio_in_stop(h);
+        if (err != ESP_OK) return err;
+    }
 
     h->ringbuf = ringbuf;
     h->running = true;
+    h->connection_generation = ws_service_generation();
+    h->opus_samples = 0;
     /* 清除上一次任务的完成信号，再创建新任务。 */
     xSemaphoreTake(h->done_sem, 0);
 
@@ -374,6 +390,7 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
         h, 5, &h->task_h, 1);   /* core 1，与 detect_Task 同一核，共享 L2 */
     if (ret != pdPASS) {
         h->running = false;
+        h->task_h = NULL;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -388,6 +405,8 @@ esp_err_t audio_in_stop(audio_in_handle_t h)
         /* ring buffer 读取最多阻塞 100 ms，任务会自行退出并释放信号量。 */
         if (xSemaphoreTake(h->done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
             ESP_LOGW(TAG, "audio_in task did not exit within timeout");
+            /* The task still owns the encoder. Never free/reuse it early. */
+            return ESP_ERR_TIMEOUT;
         }
         h->task_h = NULL;
     }
@@ -397,6 +416,8 @@ esp_err_t audio_in_stop(audio_in_handle_t h)
         opus_enc_destroy(h->opus_enc);
         h->opus_enc = NULL;
     }
+
+    h->opus_samples = 0;
 
     ESP_LOGI(TAG, "audio_in stopped");
     return ESP_OK;

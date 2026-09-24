@@ -9,6 +9,7 @@
 #include "audio_in.h"
 #include "wake_word.h"
 #include "event_bus.h"
+#include "ws_service.h"
 
 static const char *TAG = "app_state";
 
@@ -185,12 +186,17 @@ const char *app_state_name(app_state_t s)
         case APP_STATE_PLAYING:         return "PLAYING";
         case APP_STATE_ERROR:           return "ERROR";
         case APP_STATE_SLEEP:           return "SLEEP";
+        case APP_STATE_CANCELLING:      return "CANCELLING";
         default:                        return "UNKNOWN";
     }
 }
 
 esp_err_t app_state_start_listening(void)
 {
+    if (ws_service_get_state() != WS_STATE_CONNECTED) {
+        ESP_LOGW(TAG, "Cannot listen: WebSocket authentication is not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
     app_state_set(APP_STATE_LISTENING);
     /*
      * 持续对话模式下，服务端发送 speech_stopped 后 app_main 会停止
@@ -221,9 +227,6 @@ esp_err_t app_state_start_listening(void)
 esp_err_t app_state_back_to_wait_wake(bool from_timer)
 {
     app_state_t prev = app_state_get();
-    if (prev == APP_STATE_WAIT_WAKE) {
-        return ESP_OK;  /* 已经在等待唤醒，无需处理 */
-    }
 
     /* 停止静音定时器（若由定时器回调触发则跳过 stop） */
     if (!from_timer) {
@@ -257,4 +260,9 @@ void app_state_reset_silence_timer(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "reset silence_timer failed: %s", esp_err_to_name(err));
     }
+}
+
+void app_state_pause_silence_timer(void)
+{
+    stop_silence_timer();
 }
